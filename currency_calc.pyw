@@ -22,9 +22,12 @@ Version history
   1.6.5  Settings popup no longer jumps in from the corner, third "Show in" button fits,
          settings stay open while picking a "Show in" currency
   1.6.6  Smoother popup opening (no flash), "Show in" list closes on a second click
+  1.7.0  Clear button, switch "Show in" slots on/off, gold & silver (gram / troy oz) with live prices
+  1.7.1  Clear button moved above the box, settings no longer flash when changing "Show in",
+         gold/silver show price + up/down ticker only
 """
 
-VERSION = "1.6.6"
+VERSION = "1.7.1"
 import json
 import os
 import re
@@ -46,6 +49,12 @@ REFRESH_SECONDS = 6 * 3600
 FAVORITES = ["USD", "SAR", "JOD", "EUR", "GBP", "AED", "KWD", "EGP", "QAR", "BHD", "OMR", "CAD", "AUD", "JPY", "CHF", "INR", "TRY"]
 THREE_DEC = {"JOD", "KWD", "BHD", "OMR", "TND", "LYD", "IQD"}
 ZERO_DEC = {"JPY", "KRW", "VND", "CLP", "ISK", "UGX", "ITL"}
+GRAM_PER_OZ = 31.1034768                       # grams in one troy ounce
+METALS = ["XAU", "AUG", "XAG", "AGG"]          # gold oz, gold gram, silver oz, silver gram (shown first)
+UNIT_LABEL = {"XAU": "oz gold", "AUG": "g gold", "XAG": "oz silver", "AGG": "g silver"}
+METAL_PHRASE = UNIT_LABEL                      # what a click in the list types into the calculator
+CHG_ALIAS = {"ITL": "EUR", "AUG": "XAU", "AGG": "XAG"}   # these follow another code's daily change
+METALS_SECONDS = 300                           # refresh gold/silver every 5 minutes
 
 THEMES = {
     "light": dict(bg="#f3f3f3", fg="#1a1a1a", card="#ffffff", sub="#5f5f5f", accent="#0067c0", border="#d9d9d9", sel="#cce4f7", up="#15803d", down="#c62828"),
@@ -224,6 +233,10 @@ ZAR South African rand
 ZMW Zambian kwacha
 ZWG Zimbabwe Gold
 ZWL Zimbabwean dollar
+XAU Gold (troy ounce)
+AUG Gold (gram)
+XAG Silver (troy ounce)
+AGG Silver (gram)
 """.strip().splitlines()}
 
 
@@ -278,6 +291,54 @@ def add_legacy(rates):
     if rates and "EUR" in rates:
         rates.setdefault("ITL", rates["EUR"] * 1936.27)
     return rates
+
+
+def fetch_metals():
+    """Live spot prices from gold-api.com (USD per troy ounce) -> {'XAU': oz per USD, 'XAG': ...}."""
+    out = {}
+    for sym in ("XAU", "XAG"):
+        try:
+            req = urllib.request.Request(f"https://api.gold-api.com/price/{sym}", headers={"User-Agent": APP})
+            with urllib.request.urlopen(req, timeout=6) as r:
+                price = float(json.loads(r.read().decode("utf-8"))["price"])
+            if price > 0:
+                out[sym] = 1.0 / price
+        except Exception:
+            pass
+    return out
+
+
+def fetch_metal_prev():
+    """Yesterday's gold/silver (oz per USD) from the daily currency-api files; {} if unavailable."""
+    base = "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@%s/v1/currencies/usd.json"
+    for back in (1, 2):
+        try:
+            req = urllib.request.Request(base % (date.today() - timedelta(days=back)).isoformat(), headers={"User-Agent": APP})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                data = _fawaz(json.loads(r.read().decode("utf-8")))
+            out = {k: data[k] for k in ("XAU", "XAG") if k in data}
+            if out:
+                return out
+        except Exception:
+            pass
+    return {}
+
+
+def add_metals(rates, m):
+    """Add gold/silver as pseudo-currencies: ounces and grams per 1 USD."""
+    for oz, g in (("XAU", "AUG"), ("XAG", "AGG")):
+        if oz in m:
+            rates[oz] = m[oz]
+            rates[g] = m[oz] * GRAM_PER_OZ
+    return rates
+
+
+def merge_metals(rates, live, old=None):
+    m = {k: rates[k] for k in ("XAU", "XAG") if k in rates}
+    if old:
+        m.update({k: old[k] for k in ("XAU", "XAG") if k in old and k not in m})
+    m.update(live or {})
+    return add_metals(rates, m)
 
 
 def fetch_rates():
@@ -411,10 +472,31 @@ def sym_fix(expr):
     return SYM_AFTER.sub(lambda m: f"{m.group(1)} {SYMBOLS[m.group(2)]}", expr)
 
 
+_UNIT = r"(?:troy\s*)?(g|gr|gm|gms|gram|grams|oz|ozt|ounce|ounces)"
+_MET = r"(gold|silver)"
+M_NUM_UNIT = re.compile(_NUM + r"\s*" + _UNIT + r"\s*(?:of\s+)?" + _MET + r"\b", re.I)
+M_MET_NUM = re.compile(r"\b" + _MET + r"\s*" + _NUM + r"\s*" + _UNIT + r"\b", re.I)
+M_UNIT_MET = re.compile(r"\b" + _UNIT + r"\s+(?:of\s+)?" + _MET + r"\b", re.I)
+M_MET_UNIT = re.compile(r"\b" + _MET + r"\s+" + _UNIT + r"\b", re.I)
+
+
+def _mcode(metal, unit):
+    gram = unit.lower().startswith("g")
+    return {("gold", False): "XAU", ("gold", True): "AUG", ("silver", False): "XAG", ("silver", True): "AGG"}[(metal.lower(), gram)]
+
+
+def metal_fix(expr):
+    """'5g gold + 2 oz silver' -> '5 AUG + 2 XAG';  'to gold g' -> 'to AUG'"""
+    expr = M_NUM_UNIT.sub(lambda m: f"{m.group(1)} {_mcode(m.group(3), m.group(2))}", expr)
+    expr = M_MET_NUM.sub(lambda m: f"{m.group(2)} {_mcode(m.group(1), m.group(3))}", expr)
+    expr = M_UNIT_MET.sub(lambda m: _mcode(m.group(2), m.group(1)), expr)
+    return M_MET_UNIT.sub(lambda m: _mcode(m.group(1), m.group(2)), expr)
+
+
 def evaluate(expr, out, rates, parts=None):
     """Evaluate an expression with currency amounts; result is in `out`.
     Returns None for empty input; raises ValueError with a friendly message."""
-    expr = normalize(sym_fix(expr)).strip()
+    expr = metal_fix(normalize(sym_fix(expr))).strip()
     if not expr:
         return None
     if not rates:
@@ -451,8 +533,8 @@ def fmt_amt(a):
 
 
 def fmt(value, code):
-    d = 3 if code in THREE_DEC else 0 if code in ZERO_DEC else 2
-    return f"{value:,.{d}f} {code}"
+    d = 4 if code in ("XAU", "XAG") else 3 if code in THREE_DEC or code in ("AUG", "AGG") else 0 if code in ZERO_DEC else 2
+    return f"{value:,.{d}f} {UNIT_LABEL.get(code, code)}"
 
 
 # --------------------------------------------------------------------- app
@@ -557,6 +639,7 @@ class App:
         self._set_was_open = False
         self.pick_slot = None
         self._slot_was_open = False
+        self.metals_time, self._m_result, self._mfetch, self._cc_on = 0, None, False, False
         self.min_w, self.min_h = 400, 460
         self._rows = []
         self.picker = None
@@ -575,6 +658,11 @@ class App:
         self.settings = load_json(SETTINGS_FILE, {"out": "USD"})
         self.settings.setdefault("recent", [self.settings.get("out", "USD")])
         self.settings.setdefault("also", ["USD", "SAR", "JOD"])
+        self.settings.setdefault("also_on", [True, True, True])
+        self.metal_prev = cache.get("metal_prev") or {}
+        self.metal_prev_date = cache.get("metal_prev_date", "")
+        self.metal_base = cache.get("metal_base") or {}
+        self.update_metal_change()
         root.attributes("-topmost", bool(self.settings.get("topmost", False)))
         self.place_window()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -620,6 +708,9 @@ class App:
         self.out_btn.bind("<ButtonPress-1>", self._btn_press, add="+")
         self.out_var.trace_add("write", lambda *_: (self.out_btn.configure(text=f"{self.out_var.get()}   ▾"), self.out_box.sync()))
         self.out_var.set(self.out_var.get())
+        self.btn_cc = tk.Button(self.top, text="Clear", relief="flat", font=("Segoe UI", 9), cursor="hand2",
+                                command=self.clear_expr, bd=0, padx=8, pady=3)
+        self.btn_cc.pack(side="right")
         self.btn_settings = tk.Button(self.top, text="⚙ Settings", relief="flat", font=("Segoe UI", 9), cursor="hand2",
                                       command=self.open_settings, bd=0, padx=8, pady=3)
         self.btn_settings.pack(side="right")
@@ -635,8 +726,11 @@ class App:
         self.card.pack(fill="x", padx=16, pady=6)
         self.expr_var = tk.StringVar()
         self.expr_var.trace_add("write", lambda *_: self.recalc())
-        self.entry = tk.Entry(self.card.inner, textvariable=self.expr_var, font=self.f_entry, relief="flat", bd=0)
-        self.entry.pack(fill="x", padx=6, pady=(12, 4))
+        self.erow = tk.Frame(self.card.inner)
+        self.erow.pack(fill="x", padx=6, pady=(12, 4))
+        self.entry = tk.Entry(self.erow, textvariable=self.expr_var, font=self.f_entry, relief="flat", bd=0)
+        self.entry.pack(side="left", fill="x", expand=True)
+        self.entry.bind("<Escape>", lambda e: self.clear_expr())
         self.entry.bind("<Configure>", lambda e: self.fit_fonts())
         self.entry.bind("<Return>", self.commit)
         self.entry.bind("<<Paste>>", self.on_paste)
@@ -681,11 +775,12 @@ class App:
             w.configure(bg=t["bg"])
         self.lbl_to.configure(fg=t["fg"])
         self.status.configure(fg=t["sub"])
-        for w in (self.btn_refresh, self.btn_clear, self.btn_settings):
+        for w in (self.btn_refresh, self.btn_clear, self.btn_settings, self.btn_cc):
             w.configure(bg=t["bg"], fg=t["accent"], activebackground=t["sel"], activeforeground=t["accent"])
         for w in (self.card, self.hist_frame):
             w.colors(t["bg"], t["card"], t["border"])
         self.entry.configure(bg=t["card"], fg=t["fg"], insertbackground=t["fg"], disabledbackground=t["card"])
+        self.erow.configure(bg=t["card"])
         self.result.configure(bg=t["card"], fg=t["fg"])
         self.msg.configure(bg=t["card"], fg=t["sub"])
         self.extra.configure(bg=t["card"], fg=t["sub"])
@@ -727,7 +822,7 @@ class App:
 
     # ---- rates
     def refill_currencies(self):
-        self.codes = sorted(c for c in self.rates if c in NAMES) if self.rates else sorted(FAVORITES)
+        self.codes = ([m for m in METALS if m in self.rates] + sorted(c for c in self.rates if c in NAMES and c not in METALS)) if self.rates else sorted(FAVORITES)
 
     def start_fetch(self):
         if self._fetching:
@@ -737,29 +832,73 @@ class App:
 
         def work():
             try:
-                res = ("ok",) + fetch_rates()
+                r, name = fetch_rates()
+                res = ("ok", merge_metals(r, fetch_metals(), self.rates), name)
                 chg, cd, today = None, None, date.today().isoformat()
                 if self.change_date != today:
                     try:
                         chg, cd = fetch_changes(), today
                     except Exception:
                         pass
-                self._fetch_result = res + (chg, cd)
+                mp = fetch_metal_prev() if self.metal_prev_date != date.today().isoformat() else None
+                self._fetch_result = res + (chg, cd, mp)
             except Exception as e:
                 self._fetch_result = ("err", str(e))
 
         threading.Thread(target=work, daemon=True).start()
 
+    def update_metal_change(self):
+        """Up/down % for gold and silver: vs yesterday, or (if that isn't available) vs the first price seen in the last 24 h."""
+        if not self.rates:
+            return
+        now = time.time()
+        if now - self.metal_base.get("ts", 0) > 86400:
+            self.metal_base = {"ts": now}
+        for sym in ("XAU", "XAG"):
+            if sym in self.rates and sym not in self.metal_base:
+                self.metal_base[sym] = self.rates[sym]
+            rate, ref = self.rates.get(sym), self.metal_prev.get(sym) or self.metal_base.get(sym)
+            if rate and ref:
+                self.change[sym] = (ref / rate - 1) * 100
+
+    def _save_rates(self):
+        save_json(RATES_FILE, {"rates": self.rates, "time": self.rates_time, "source": self.source,
+                               "change": self.change, "change_date": self.change_date,
+                               "metal_prev": self.metal_prev, "metal_prev_date": self.metal_prev_date,
+                               "metal_base": self.metal_base})
+
+    def start_metals(self):
+        if self._mfetch:
+            return
+        self._mfetch = True
+
+        def work():
+            self._m_result = fetch_metals()
+
+        threading.Thread(target=work, daemon=True).start()
+
     def poll_fetch(self):
+        mres, self._m_result = self._m_result, None
+        if mres is not None:
+            self._mfetch, self.metals_time = False, time.time()
+            if mres and self.rates:
+                add_metals(self.rates, mres)
+                self.update_metal_change()
+                self._save_rates()
+                self.recalc()
+                self.draw_list()
         res, self._fetch_result = self._fetch_result, None
         if res:
             self._fetching = False
             if res[0] == "ok":
                 self.rates, self.source, self.rates_time = res[1], res[2], time.time()
+                self.metals_time = self.rates_time
                 if res[3]:
                     self.change, self.change_date = res[3], res[4]
-                save_json(RATES_FILE, {"rates": self.rates, "time": self.rates_time, "source": self.source,
-                                       "change": self.change, "change_date": self.change_date})
+                if res[5]:
+                    self.metal_prev, self.metal_prev_date = res[5], date.today().isoformat()
+                self.update_metal_change()
+                self._save_rates()
                 self.refill_currencies()
                 self.recalc()
                 self.draw_list()
@@ -771,6 +910,8 @@ class App:
     def tick(self):
         if time.time() - self.rates_time > REFRESH_SECONDS:
             self.start_fetch()
+        elif self.rates and not self._fetching and time.time() - self.metals_time > METALS_SECONDS:
+            self.start_metals()
         self.update_status()
         self.root.after(60000, self.tick)
 
@@ -887,13 +1028,14 @@ class App:
         c = self.canvas
         c.delete("hl")
         i = int(c.canvasy(e.y) // ROW_H)
-        if 0 <= i < len(self._rows):
+        if 0 <= i < len(self._rows) and self._rows[i]:
             c.create_rectangle(4, i * ROW_H, c.winfo_width() - 4, (i + 1) * ROW_H - 1,
                                fill=THEMES[self.theme]["sel"], outline="", tags="hl")
             c.tag_lower("hl")
 
     def insert_code(self, code):
         self._click_job = None
+        code = METAL_PHRASE.get(code, code)
         before = self.entry.get()[:self.entry.index("insert")]
         self.entry.insert("insert", (" " if before[-1:].isalpha() else "") + code)
         self.entry.focus_set()
@@ -938,18 +1080,32 @@ class App:
             c.create_text(w / 2, 40, text="No rates yet - press Refresh", fill=t["sub"], font=self.f_name)
             return
         q = self.search_var.get().strip().lower()
+        metals = [k for k in METALS if k in self.rates]
+        others = sorted(k for k in self.rates if k in NAMES and k not in METALS)
+        if q:
+            seq = [k for k in metals + others if q in k.lower() or q in NAMES[k].lower()]
+        else:
+            seq = []
+            if metals:
+                seq += [("Gold & silver", "type  5g gold  ·  2oz silver  ·  100 USD to gold g")] + metals + [("Currencies", "")]
+            seq += others
         y = 0
-        for code in sorted(k for k in self.rates if k in NAMES):
-            name = NAMES[code]
-            if q and q not in code.lower() and q not in name.lower():
+        for code in seq:
+            if isinstance(code, tuple):                       # section heading
+                self._rows.append(None)
+                c.create_text(14, y + (22 if code[1] else 34), anchor="w", text=code[0].upper(), font=("Segoe UI", 8, "bold"), fill=t["sub"])
+                if code[1]:
+                    c.create_text(14, y + 38, anchor="w", text=code[1], font=self.f_name, fill=t["sub"])
+                y += ROW_H
                 continue
+            name = NAMES[code]
             self._rows.append(code)
             rate = self.rates[code]
-            txt = f"{fmt_rate(rate)} / {fmt_usd(rate)}"
+            txt = fmt_usd(rate) if code in METALS else f"{fmt_rate(rate)} / {fmt_usd(rate)}"
             rw = self.f_rate.measure(txt)
             c.create_text(14, y + 8, anchor="nw", text=code, font=self.f_code, fill=t["fg"])
             c.create_text(14, y + 29, anchor="nw", text=self._fit(name, w - 14 - rw - 30), font=self.f_name, fill=t["sub"])
-            chg = self.change.get("EUR" if code == "ITL" else code)
+            chg = self.change.get(CHG_ALIAS.get(code, code))
             if chg is None or code == "USD":
                 c.create_text(w - 14, y + ROW_H // 2, anchor="e", text=txt, font=self.f_rate, fill=t["fg"])
             else:
@@ -962,7 +1118,6 @@ class App:
             c.create_line(14, y + ROW_H - 1, w - 14, y + ROW_H - 1, fill=t["border"])
             y += ROW_H
         c.configure(scrollregion=(0, 0, w, max(y, 1)))
-
     def update_minsize(self):
         self.root.update_idletasks()
         self.min_w = max(self.top.winfo_reqwidth() + 32, 380)
@@ -999,8 +1154,21 @@ class App:
         pw.attributes("-topmost", True)
         pw.attributes("-alpha", 0.0)
         pw.configure(bg=t["border"])
-        inner = tk.Frame(pw, bg=t["card"])
+        inner = self._set_inner = tk.Frame(pw, bg=t["card"])
         inner.pack(fill="both", expand=True, padx=1, pady=1)
+        self._build_settings(inner, t)
+        pw.update_idletasks()
+        w = max(260, pw.winfo_reqwidth())
+        x = self.btn_settings.winfo_rootx() + self.btn_settings.winfo_width() - w
+        y = self.btn_settings.winfo_rooty() + self.btn_settings.winfo_height() + 2
+        pw.geometry(f"{w}x{pw.winfo_reqheight()}+{x}+{y}")
+        pw.deiconify()
+        pw.bind("<FocusOut>", lambda e: self.root.after(150, self._settings_check))
+        pw.bind("<Escape>", lambda e: self.close_settings())
+        pw.focus_force()
+        reveal(pw)
+
+    def _build_settings(self, inner, t):
 
         def label(text, size=9, bold=False, color=None, pady=(0, 0)):
             tk.Label(inner, text=text, anchor="w", bg=t["card"], fg=color or t["fg"],
@@ -1045,38 +1213,54 @@ class App:
         slots = tk.Frame(inner, bg=t["card"])
         slots.pack(fill="x", padx=14, pady=(2, 0))
         tk.Label(slots, text="Show in:", bg=t["card"], fg=t["sub"], font=("Segoe UI", 9)).pack(side="left")
+        flags = self.settings.get("also_on", [True, True, True])
         for i, code in enumerate(self.settings["also"]):
-            box, b = rbtn(slots, code, None, t["sel"], t["fg"], t["border"], fitw=True, font=("Segoe UI", 9, "bold"), padx=6, pady=2)
+            on = flags[i] if i < len(flags) else True
+            tg = tk.Button(slots, text="✓" if on else "☐", relief="flat", bd=0, cursor="hand2", font=("Segoe UI", 10),
+                           padx=2, pady=0, bg=t["card"], fg=t["accent"] if on else t["sub"], activebackground=t["card"],
+                           activeforeground=t["fg"], command=lambda i=i: self._slot_toggle(i))
+            tg.pack(side="left", padx=(8, 0))
+            box, b = rbtn(slots, code, None, t["sel"], t["fg"] if on else t["sub"], t["border"], fitw=True,
+                          font=("Segoe UI", 9, "bold"), padx=6, pady=2)
             b.configure(command=lambda i=i, b=b: self._slot_pick(i, b))
             b.bind("<ButtonPress-1>", lambda e, i=i: self._slot_press(i), add="+")
-            box.pack(side="left", padx=(6, 0))
+            box.pack(side="left", padx=(2, 0))
+        tk.Label(inner, text="Tick to show  ·  click a code to change it", bg=t["card"], fg=t["sub"],
+                 font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=14, pady=(2, 0))
         rule()
         row(f"{'Hide' if self.panel_open else 'Show'} currency codes   (Alt+P)", self._settings_codes)
         rule()
         label("About", 9, True, t["sub"])
         label("Currency Calculator", 10, False, None, (4, 0))
         label(f"Version {VERSION}", 9, False, t["sub"], (0, 12))
+
+    def _refresh_settings(self):
+        """Rebuild the settings contents in place (the popup stays open, so nothing flashes)."""
+        pw = self.settings_win
+        if not pw:
+            return
+        t = THEMES[self.theme]
+        pw.configure(bg=t["border"])
+        old = self._set_inner
+        new = tk.Frame(pw, bg=t["card"])
+        self._build_settings(new, t)
+        new.pack(fill="both", expand=True, padx=1, pady=1)
+        old.destroy()
+        self._set_inner = new
         pw.update_idletasks()
         w = max(260, pw.winfo_reqwidth())
         x = self.btn_settings.winfo_rootx() + self.btn_settings.winfo_width() - w
         y = self.btn_settings.winfo_rooty() + self.btn_settings.winfo_height() + 2
         pw.geometry(f"{w}x{pw.winfo_reqheight()}+{x}+{y}")
-        pw.deiconify()
-        pw.bind("<FocusOut>", lambda e: self.root.after(150, self._settings_check))
-        pw.bind("<Escape>", lambda e: self.close_settings())
-        pw.focus_force()
-        reveal(pw)
 
     def _settings_theme(self, m):
         self.set_theme(m)
-        self.close_settings()
-        self.open_settings()          # rebuild so the popup itself picks up the new colours
+        self._refresh_settings()      # rebuild in place so the popup itself picks up the new colours
 
     def _settings_toggle(self, key):
         self.settings[key] = not self.settings.get(key, True)
         save_json(SETTINGS_FILE, self.settings)
-        self.close_settings()
-        self.open_settings()
+        self._refresh_settings()
         self.recalc()
 
     def _slot_press(self, i):
@@ -1096,7 +1280,17 @@ class App:
         self.settings["also"] = also
         save_json(SETTINGS_FILE, self.settings)
         self.recalc()
-        self.root.after(60, self._reopen_settings)
+        self.root.after(60, self._refresh_settings)
+
+    def _slot_toggle(self, i):
+        on = list(self.settings.get("also_on", [True, True, True]))
+        while len(on) < 3:
+            on.append(True)
+        on[i] = not on[i]
+        self.settings["also_on"] = on
+        save_json(SETTINGS_FILE, self.settings)
+        self.recalc()
+        self._refresh_settings()
 
     def _reopen_settings(self):
         self.close_settings()
@@ -1292,9 +1486,13 @@ class App:
         save_json(SETTINGS_FILE, self.settings)
         self.recalc()
 
+    def clear_expr(self):
+        self.expr_var.set("")
+        self.entry.focus_set()
+
     def recalc(self):
         self.root.after_idle(self.fit_fonts)
-        body, tgt = split_target(self.expr_var.get())
+        body, tgt = split_target(metal_fix(self.expr_var.get()))
         out = tgt or self.out_var.get()
         self.cur_out = out
         parts = []
@@ -1316,10 +1514,13 @@ class App:
         self.msg.configure(text=(f"One-off conversion to {out}\n" if tgt else "") + "Click result to copy · Enter to save")
         lines = []
         if self.settings.get("show_breakdown", True) and parts and (len(parts) > 1 or parts[0][1] != out):
-            lines.append("  ·  ".join(f"{fmt_amt(a)} {c} = {fmt(x, out)}" for a, c, x in parts))
+            lines.append("  ·  ".join(f"{fmt_amt(a)} {UNIT_LABEL.get(c, c)} = {fmt(x, out)}" for a, c, x in parts))
         if self.settings.get("show_also", True):
             tot = []
-            for c in self.settings.get("also", []):
+            flags = self.settings.get("also_on", [True, True, True])
+            for k, c in enumerate(self.settings.get("also", [])):
+                if k < len(flags) and not flags[k]:
+                    continue
                 if c != out and c in (self.rates or {}):
                     try:
                         tot.append(fmt(evaluate(body, c, self.rates), c))
@@ -1345,7 +1546,7 @@ class App:
 
     def copy_result(self, _=None):
         if self.last_ok:
-            self.copy_text(self.last_ok.rsplit(" ", 1)[0].replace(",", ""))
+            self.copy_text(self.last_ok.split(" ", 1)[0].replace(",", ""))
 
     def copy_text(self, text):
         self.root.clipboard_clear()
@@ -1361,7 +1562,7 @@ class App:
         if not self.last_ok:
             return
         m, full = self._menu(), self.last_ok
-        m.add_command(label="Copy number", command=lambda: self.copy_text(full.rsplit(" ", 1)[0].replace(",", "")))
+        m.add_command(label="Copy number", command=lambda: self.copy_text(full.split(" ", 1)[0].replace(",", "")))
         m.add_command(label="Copy with currency", command=lambda: self.copy_text(full))
         m.add_command(label="Copy expression and result",
                       command=lambda: self.copy_text(f"{self.expr_var.get().strip()} = {full}"))

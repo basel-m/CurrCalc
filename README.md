@@ -14,6 +14,7 @@ $15 + €5 + 20 JOD       ->   works with symbols too
 - Searchable output-currency picker with your 5 most recent currencies on top
 - Currency list panel (**Alt+P**) with codes, names, rates and a daily up/down indicator
 - History with rate dates, copy options (right-click) and delete
+- Gold and silver in grams and troy ounces, e.g. `5g gold + 2oz silver` or `100 USD to gold g` (live spot prices, listed first in the Alt+P panel)
 - Pin (always on top), dark/light/auto theme, remembers window size and position
 - Works offline using the last downloaded rates
 
@@ -28,9 +29,10 @@ Double-click `build_exe.bat`. The app is created at `dist\CurrencyCalc.exe`.
 Rates come from [open.er-api.com](https://open.er-api.com), with a backup from
 [fawazahmed0/currency-api](https://github.com/fawazahmed0/exchange-api). They are mid-market rates,
 so they will be slightly better than what a bank or exchange office charges.
+Gold and silver spot prices come from [gold-api.com](https://gold-api.com) and refresh every 5 minutes.
 
 ## Your data
 Settings, history and cached rates are stored in `%APPDATA%\CurrencyCalc` (not in this folder).
 
 ## Version
-See the version history at the top of `currency_calc.pyw`. Current: **1.6.6**
+See the version history at the top of `currency_calc.pyw`. Current: **1.7.1**
