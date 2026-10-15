@@ -25,9 +25,10 @@ Version history
   1.7.0  Clear button, switch "Show in" slots on/off, gold & silver (gram / troy oz) with live prices
   1.7.1  Clear button moved above the box, settings no longer flash when changing "Show in",
          gold/silver show price + up/down ticker only
+  1.8.0  Gold & silver by country ("1 g gold in india"), editable local adjustments, settings flash fix
 """
 
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 import json
 import os
 import re
@@ -54,7 +55,21 @@ METALS = ["XAU", "AUG", "XAG", "AGG"]          # gold oz, gold gram, silver oz, 
 UNIT_LABEL = {"XAU": "oz gold", "AUG": "g gold", "XAG": "oz silver", "AGG": "g silver"}
 METAL_PHRASE = UNIT_LABEL                      # what a click in the list types into the calculator
 CHG_ALIAS = {"ITL": "EUR", "AUG": "XAU", "AGG": "XAG"}   # these follow another code's daily change
-METALS_SECONDS = 300                           # refresh gold/silver every 5 minutes
+METALS_SECONDS = 300
+# key: (name, currency, default % added to the spot price, note).  Only India is pre-filled; edit the rest in Settings.
+REGIONS = {
+    "IND": ("India", "INR", 18.45, "15% import duty + 3% GST"),
+    "SAU": ("Saudi Arabia", "SAR", 0.0, "bullion 0% VAT, jewellery 15% VAT"),
+    "ARE": ("UAE", "AED", 0.0, "bullion 0% VAT, jewellery 5% VAT"),
+    "JOR": ("Jordan", "JOD", 0.0, "not checked yet, set your own"),
+    "EGY": ("Egypt", "EGP", 0.0, "14% VAT on making charges only"),
+    "TUR": ("Turkey", "TRY", 0.0, "not checked yet, set your own"),
+    "USA": ("United States", "USD", 0.0, "sales tax and dealer premium vary"),
+}
+REGION_WORDS = {"india": "IND", "saudi": "SAU", "saudi arabia": "SAU", "ksa": "SAU", "uae": "ARE", "dubai": "ARE",
+                "emirates": "ARE", "abu dhabi": "ARE", "united arab emirates": "ARE", "jordan": "JOR", "egypt": "EGY",
+                "turkey": "TUR", "turkiye": "TUR", "türkiye": "TUR", "usa": "USA", "united states": "USA", "america": "USA"}
+REGION_RE = re.compile(r"^(.*\S)\s+(?:to|in|into|as|at)\s+(" + "|".join(re.escape(w) for w in sorted(REGION_WORDS, key=len, reverse=True)) + r")\s*$", re.I)                           # refresh gold/silver every 5 minutes
 
 THEMES = {
     "light": dict(bg="#f3f3f3", fg="#1a1a1a", card="#ffffff", sub="#5f5f5f", accent="#0067c0", border="#d9d9d9", sel="#cce4f7", up="#15803d", down="#c62828"),
@@ -493,6 +508,23 @@ def metal_fix(expr):
     return M_MET_UNIT.sub(lambda m: _mcode(m.group(1), m.group(2)), expr)
 
 
+def region_split(text):
+    """'1 g gold in india' -> ('1 g gold', 'IND')"""
+    m = REGION_RE.match(text.strip())
+    return (m.group(1), REGION_WORDS[m.group(2).lower()]) if m else (text, None)
+
+
+def region_rates(rates, pct):
+    """Make gold/silver cost pct% more (duty, tax, premium); works in both directions."""
+    if not rates or not pct:
+        return rates
+    r, f = dict(rates), 1 + pct / 100
+    for m in METALS:
+        if m in r:
+            r[m] = r[m] / f
+    return r
+
+
 def evaluate(expr, out, rates, parts=None):
     """Evaluate an expression with currency amounts; result is in `out`.
     Returns None for empty input; raises ValueError with a friendly message."""
@@ -640,6 +672,7 @@ class App:
         self.pick_slot = None
         self._slot_was_open = False
         self.metals_time, self._m_result, self._mfetch, self._cc_on = 0, None, False, False
+        self.regions_win = None
         self.min_w, self.min_h = 400, 460
         self._rows = []
         self.picker = None
@@ -659,6 +692,7 @@ class App:
         self.settings.setdefault("recent", [self.settings.get("out", "USD")])
         self.settings.setdefault("also", ["USD", "SAR", "JOD"])
         self.settings.setdefault("also_on", [True, True, True])
+        self.settings.setdefault("region_pct", {})
         self.metal_prev = cache.get("metal_prev") or {}
         self.metal_prev_date = cache.get("metal_prev_date", "")
         self.metal_base = cache.get("metal_base") or {}
@@ -1087,7 +1121,7 @@ class App:
         else:
             seq = []
             if metals:
-                seq += [("Gold & silver", "type  5g gold  ·  2oz silver  ·  100 USD to gold g")] + metals + [("Currencies", "")]
+                seq += [("Gold & silver", "type  5g gold  ·  100 USD to gold g  ·  1 g gold in india")] + metals + [("Currencies", "")]
             seq += others
         y = 0
         for code in seq:
@@ -1229,6 +1263,7 @@ class App:
                  font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=14, pady=(2, 0))
         rule()
         row(f"{'Hide' if self.panel_open else 'Show'} currency codes   (Alt+P)", self._settings_codes)
+        row("Gold & silver by country…", self._settings_regions)
         rule()
         label("About", 9, True, t["sub"])
         label("Currency Calculator", 10, False, None, (4, 0))
@@ -1243,9 +1278,12 @@ class App:
         pw.configure(bg=t["border"])
         old = self._set_inner
         new = tk.Frame(pw, bg=t["card"])
+        new.place(x=1, y=1, relwidth=1, relheight=1, width=-2, height=-2)     # sits on top of the old contents
         self._build_settings(new, t)
-        new.pack(fill="both", expand=True, padx=1, pady=1)
+        pw.update()                      # the rounded boxes draw themselves while the old contents are still showing
         old.destroy()
+        new.place_forget()
+        new.pack(fill="both", expand=True, padx=1, pady=1)
         self._set_inner = new
         pw.update_idletasks()
         w = max(260, pw.winfo_reqwidth())
@@ -1262,6 +1300,89 @@ class App:
         save_json(SETTINGS_FILE, self.settings)
         self._refresh_settings()
         self.recalc()
+
+    def region_pct(self, key):
+        return self.settings.get("region_pct", {}).get(key, REGIONS[key][2])
+
+    def _settings_regions(self):
+        self.close_settings()
+        self.open_regions()
+
+    def open_regions(self):
+        if self.regions_win:
+            return self.close_regions()
+        t = THEMES[self.theme]
+        pw = self.regions_win = tk.Toplevel(self.root)
+        pw.withdraw()
+        pw.overrideredirect(True)
+        pw.attributes("-topmost", True)
+        pw.attributes("-alpha", 0.0)
+        pw.configure(bg=t["border"])
+        inner = tk.Frame(pw, bg=t["card"])
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        tk.Label(inner, text="Gold & silver by country", bg=t["card"], fg=t["fg"], font=("Segoe UI Semibold", 11),
+                 anchor="w").pack(fill="x", padx=14, pady=(12, 2))
+        tk.Label(inner, text="Type e.g.  1 g gold in india.  The % is added to the spot price (duty, tax,\n"
+                             "typical premium). Edit it to match your market; 0 means plain spot.",
+                 bg=t["card"], fg=t["sub"], font=("Segoe UI", 8), anchor="w", justify="left").pack(fill="x", padx=14, pady=(0, 8))
+        self._reg_vars = {}
+        for key, (name, cur, _d, note) in REGIONS.items():
+            row = tk.Frame(inner, bg=t["card"])
+            row.pack(fill="x", padx=14, pady=3)
+            tk.Label(row, text="%", bg=t["card"], fg=t["sub"], font=("Segoe UI", 10)).pack(side="right", padx=(3, 0))
+            box = Round(row, fitw=True, radius=8, pad=3)
+            box.pack(side="right")
+            var = self._reg_vars[key] = tk.StringVar(value=f"{self.region_pct(key):g}")
+            tk.Entry(box.inner, textvariable=var, width=7, justify="right", font=("Segoe UI", 10), relief="flat", bd=0,
+                     bg=t["sel"], fg=t["fg"], insertbackground=t["fg"]).pack(padx=6, pady=3)
+            box.colors(t["card"], t["sel"], t["sel"])
+            box.sync()
+            left = tk.Frame(row, bg=t["card"])
+            left.pack(side="left", fill="x", expand=True)
+            tk.Label(left, text=f"{name}  ·  {cur}", bg=t["card"], fg=t["fg"], font=("Segoe UI", 10, "bold"), anchor="w").pack(fill="x")
+            tk.Label(left, text=note, bg=t["card"], fg=t["sub"], font=("Segoe UI", 8), anchor="w").pack(fill="x")
+            var.trace_add("write", lambda *_, k=key, v=var: self._set_region(k, v.get()))
+        tk.Button(inner, text="Reset to defaults", relief="flat", bd=0, cursor="hand2", font=("Segoe UI", 9), padx=14, pady=4,
+                  bg=t["card"], fg=t["accent"], activebackground=t["sel"], activeforeground=t["accent"], anchor="w",
+                  command=self._reset_regions).pack(fill="x", pady=(6, 8))
+        pw.update_idletasks()
+        w = max(360, pw.winfo_reqwidth())
+        x = self.btn_settings.winfo_rootx() + self.btn_settings.winfo_width() - w
+        y = self.btn_settings.winfo_rooty() + self.btn_settings.winfo_height() + 2
+        pw.geometry(f"{w}x{pw.winfo_reqheight()}+{x}+{y}")
+        pw.deiconify()
+        pw.bind("<FocusOut>", lambda e: self.root.after(150, self._regions_check))
+        pw.bind("<Escape>", lambda e: self.close_regions())
+        pw.focus_force()
+        reveal(pw)
+
+    def _set_region(self, key, text):
+        try:
+            x = float(text.replace(",", ".").strip())
+        except ValueError:
+            return
+        self.settings.setdefault("region_pct", {})[key] = max(-50.0, min(200.0, x))
+        save_json(SETTINGS_FILE, self.settings)
+        self.recalc()
+
+    def _reset_regions(self):
+        self.settings["region_pct"] = {}
+        save_json(SETTINGS_FILE, self.settings)
+        for key, var in self._reg_vars.items():
+            var.set(f"{REGIONS[key][2]:g}")
+        self.recalc()
+
+    def _regions_check(self):
+        if self.regions_win:
+            w = self.root.focus_get()
+            if w is None or not str(w).startswith(str(self.regions_win)):
+                self.close_regions()
+
+    def close_regions(self):
+        if self.regions_win:
+            self.regions_win.destroy()
+            self.regions_win = None
+            self.entry.focus_set()
 
     def _slot_press(self, i):
         self._slot_was_open = self.picker is not None and self.pick_slot == i
@@ -1492,14 +1613,19 @@ class App:
 
     def recalc(self):
         self.root.after_idle(self.fit_fonts)
-        body, tgt = split_target(metal_fix(self.expr_var.get()))
+        raw, region = region_split(self.expr_var.get())
+        body, tgt = split_target(metal_fix(raw))
+        rates = self.rates
+        if region:
+            tgt = REGIONS[region][1]
+            rates = region_rates(self.rates, self.region_pct(region))
         out = tgt or self.out_var.get()
         self.cur_out = out
         parts = []
         try:
             if tgt and self.rates and tgt not in self.rates:
                 raise ValueError(f"Unknown currency: {tgt}")
-            v = evaluate(body, out, self.rates, parts)
+            v = evaluate(body, out, rates, parts)
         except ValueError as e:
             self.last_ok = None
             self.msg.configure(text=str(e))
@@ -1511,7 +1637,12 @@ class App:
             return self._extra("")
         self.last_ok = fmt(v, out)
         self.result.configure(text=self.last_ok)
-        self.msg.configure(text=(f"One-off conversion to {out}\n" if tgt else "") + "Click result to copy · Enter to save")
+        note = f"One-off conversion to {out}\n" if tgt else ""
+        if region:
+            pc = self.region_pct(region)
+            note = (f"{REGIONS[region][0]}: spot price {pc:+.2f}% (local adjustment, edit in Settings)\n" if pc
+                    else f"{REGIONS[region][0]}: spot price, no local adjustment set\n")
+        self.msg.configure(text=note + "Click result to copy · Enter to save")
         lines = []
         if self.settings.get("show_breakdown", True) and parts and (len(parts) > 1 or parts[0][1] != out):
             lines.append("  ·  ".join(f"{fmt_amt(a)} {UNIT_LABEL.get(c, c)} = {fmt(x, out)}" for a, c, x in parts))
@@ -1523,7 +1654,7 @@ class App:
                     continue
                 if c != out and c in (self.rates or {}):
                     try:
-                        tot.append(fmt(evaluate(body, c, self.rates), c))
+                        tot.append(fmt(evaluate(body, c, rates), c))
                     except ValueError:
                         pass
             if tot:
@@ -1644,7 +1775,7 @@ class App:
         sel = self.listbox.curselection()
         if sel:
             h = self.history[sel[0]]
-            if not split_target(h["expr"])[1]:
+            if not (split_target(metal_fix(h["expr"]))[1] or region_split(h["expr"])[1]):
                 self.out_var.set(h["out"])
                 self.on_out_change()
             self.expr_var.set(h["expr"])

@@ -15,6 +15,7 @@ $15 + €5 + 20 JOD       ->   works with symbols too
 - Currency list panel (**Alt+P**) with codes, names, rates and a daily up/down indicator
 - History with rate dates, copy options (right-click) and delete
 - Gold and silver in grams and troy ounces, e.g. `5g gold + 2oz silver` or `100 USD to gold g` (live spot prices, listed first in the Alt+P panel)
+- Gold and silver by country, e.g. `1 g gold in india` (adds editable duty/tax percentages to the spot price)
 - Pin (always on top), dark/light/auto theme, remembers window size and position
 - Works offline using the last downloaded rates
 
@@ -35,4 +36,4 @@ Gold and silver spot prices come from [gold-api.com](https://gold-api.com) and r
 Settings, history and cached rates are stored in `%APPDATA%\CurrencyCalc` (not in this folder).
 
 ## Version
-See the version history at the top of `currency_calc.pyw`. Current: **1.7.1**
+See the version history at the top of `currency_calc.pyw`. Current: **1.8.0**
